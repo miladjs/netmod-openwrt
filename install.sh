@@ -99,8 +99,64 @@ START=99
 STOP=10
 USE_PROCD=1
 
+resolve_server_ip() {
+    local host="$1" ip=""
+    case "$host" in
+        *[!0-9.]*|"")
+            ip="$(nslookup "$host" 2>/dev/null | awk '/^Address [0-9]+: [0-9.]+$/ {print $3; exit}')"
+            ;;
+        *)
+            ip="$host"
+            ;;
+    esac
+    echo "$ip"
+}
+
+test_url() {
+    local url="$1"
+    curl -fsS -I --connect-timeout 8 --max-time 12 "$url" >/dev/null 2>&1
+}
+
+test_url_socks() {
+    local url="$1" socks_port="$2"
+    curl -fsS -I --connect-timeout 8 --max-time 12 --socks5-hostname 127.0.0.1:"$socks_port" "$url" >/dev/null 2>&1
+}
+
+block_quic() {
+    nft add chain inet netmod quic_prerouting { type filter hook prerouting priority -150 \; } 2>/dev/null
+    nft add chain inet netmod quic_output { type filter hook output priority -150 \; } 2>/dev/null
+    nft add rule inet netmod quic_prerouting udp dport 443 drop 2>/dev/null
+    nft add rule inet netmod quic_output udp dport 443 drop 2>/dev/null
+}
+
+ensure_youtube_access() {
+    local url="https://www.youtube.com/generate_204"
+    local socks_port="$1"
+    logger -t netmod "Testing YouTube connectivity..."
+    if test_url "$url"; then
+        logger -t netmod "YouTube OK (default path)"
+        return 0
+    fi
+    if test_url_socks "$url" "$socks_port"; then
+        logger -t netmod "YouTube OK via SOCKS"
+        return 0
+    fi
+    if curl -4 -fsS -I --connect-timeout 8 --max-time 12 "$url" >/dev/null 2>&1; then
+        logger -t netmod "YouTube OK with IPv4 forced"
+        return 0
+    fi
+    logger -t netmod "Blocking QUIC (UDP/443) and retrying..."
+    block_quic
+    if test_url "$url"; then
+        logger -t netmod "YouTube OK after blocking QUIC"
+        return 0
+    fi
+    logger -t netmod "YouTube test failed after fallbacks"
+    return 1
+}
+
 start_service() {
-    local enabled server port username password socks_port redsocks_port
+    local enabled server port username password socks_port redsocks_port server_ip
     
     config_load netmod
     config_get enabled config enabled 0
@@ -179,6 +235,12 @@ REDSOCKS_CONF_EOF
     
     /etc/init.d/redsocks restart
     
+    server_ip="$(resolve_server_ip "$server")"
+    [ -z "$server_ip" ] && {
+        logger -t netmod "ERROR: Unable to resolve server address: $server"
+        return 1
+    }
+
     # Setup nftables firewall rules
     nft delete table inet netmod 2>/dev/null
     nft add table inet netmod
@@ -186,12 +248,12 @@ REDSOCKS_CONF_EOF
     nft add chain inet netmod output { type nat hook output priority -100 \; }
     
     # Prerouting chain (LAN traffic)
-    nft add rule inet netmod prerouting ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, $server } return
+    nft add rule inet netmod prerouting ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, $server_ip } return
     nft add rule inet netmod prerouting ip protocol tcp redirect to :$redsocks_port
     
     # Output chain (Router traffic - exclude redsocks user to prevent loop)
     nft add rule inet netmod output meta skuid 65534 return
-    nft add rule inet netmod output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, $server } return
+    nft add rule inet netmod output ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, $server_ip } return
     nft add rule inet netmod output ip protocol tcp redirect to :$redsocks_port
     
     # Configure DNS-over-HTTPS
@@ -203,6 +265,8 @@ REDSOCKS_CONF_EOF
     uci commit dhcp
     /etc/init.d/dnsmasq restart
     
+    ensure_youtube_access "$socks_port"
+
     logger -t netmod "Service started successfully"
 }
 
