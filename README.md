@@ -21,14 +21,14 @@ SSH tunnel manager for OpenWRT routers to bypass internet filtering. Provides a 
 
 SSH into your OpenWRT router and run:
 ```bash
-wget -O /tmp/install.sh https://raw.githubusercontent.com/miladjs/netmod-openwrt/main/install.sh
-sh ./install.sh install
+wget -O /install.sh https://raw.githubusercontent.com/miladjs/netmod-openwrt/main/install.sh
+sh /install.sh install
 ```
 
 Or using curl:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/miladjs/netmod-openwrt/main/install.sh -o /tmp/install.sh
-sh ./install.sh install
+curl -fsSL https://raw.githubusercontent.com/miladjs/netmod-openwrt/main/install.sh -o /install.sh
+sh /install.sh install
 ```
 
 ### Configuration
@@ -148,7 +148,7 @@ uci commit netmod
 
 ## Uninstallation
 ```bash
-sh /tmp/install.sh remove
+sh /install.sh remove
 ```
 
 Or using opkg:
