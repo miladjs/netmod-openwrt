@@ -4,7 +4,7 @@ cat > install.sh << 'INSTALL_EOF'
 # NetMod OpenWRT - SSH Tunnel Installer
 # Author: miladjs
 # Repository: https://github.com/miladjs/netmod-openwrt
-# Description: Bypass internet filtering using SSH tunnel (similar to NetMod for Windows)
+# Description: NetMod is a free, advanced VPN client and set of network tool, offering VPN protocols including SSH, HTTP(S), Socks, VMess, VLess, Trojan, Shadowsocks
 #
 
 set -e
@@ -48,7 +48,7 @@ do_install() {
     # Step 1: Install dependencies
     log_info "Step 1/7: Installing dependencies..."
     opkg update > /dev/null 2>&1
-    opkg install autossh redsocks https-dns-proxy luci-compat curl > /dev/null 2>&1
+    opkg install autossh redsocks https-dns-proxy luci-compat curl sshpass > /dev/null 2>&1
     log_success "Dependencies installed"
     
     # Step 2: Disable IPv6
@@ -84,6 +84,7 @@ config netmod 'config'
     option server ''
     option port '22'
     option username 'root'
+    option password ''
     option socks_port '1080'
     option redsocks_port '12345'
 UCI_EOF
@@ -99,17 +100,20 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
-    local enabled server port username socks_port redsocks_port
+    local enabled server port username password socks_port redsocks_port
     
     config_load netmod
     config_get enabled config enabled 0
     config_get server config server
     config_get port config port 22
     config_get username config username root
+    config_get password config password
     config_get socks_port config socks_port 1080
     config_get redsocks_port config redsocks_port 12345
     
     [ "$enabled" != "1" ] && {
+        stop_processes
+        cleanup_network
         logger -t netmod "Service disabled"
         return 0
     }
@@ -121,16 +125,36 @@ start_service() {
     
     logger -t netmod "Starting SSH tunnel to $server:$port"
     
+    if [ -n "$password" ]; then
+        local sshpass_path
+        sshpass_path="$(command -v sshpass 2>/dev/null)"
+        [ -z "$sshpass_path" ] && {
+            logger -t netmod "ERROR: sshpass not installed"
+            return 1
+        }
+    fi
+    
     # Start autossh tunnel
     procd_open_instance autossh
-    procd_set_param command /usr/sbin/autossh \
-        -M 0 \
-        -o "ServerAliveInterval=30" \
-        -o "ServerAliveCountMax=3" \
-        -o "ExitOnForwardFailure=yes" \
-        -o "StrictHostKeyChecking=no" \
-        -N -D 127.0.0.1:$socks_port \
-        -p $port ${username}@${server}
+    if [ -n "$password" ]; then
+        procd_set_param command "$sshpass_path" -p "$password" /usr/sbin/autossh \
+            -M 0 \
+            -o "ServerAliveInterval=30" \
+            -o "ServerAliveCountMax=3" \
+            -o "ExitOnForwardFailure=yes" \
+            -o "StrictHostKeyChecking=no" \
+            -N -D 127.0.0.1:$socks_port \
+            -p $port ${username}@${server}
+    else
+        procd_set_param command /usr/sbin/autossh \
+            -M 0 \
+            -o "ServerAliveInterval=30" \
+            -o "ServerAliveCountMax=3" \
+            -o "ExitOnForwardFailure=yes" \
+            -o "StrictHostKeyChecking=no" \
+            -N -D 127.0.0.1:$socks_port \
+            -p $port ${username}@${server}
+    fi
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -182,16 +206,23 @@ REDSOCKS_CONF_EOF
     logger -t netmod "Service started successfully"
 }
 
-stop_service() {
+stop_processes() {
     killall autossh 2>/dev/null
     /etc/init.d/redsocks stop
+}
+
+cleanup_network() {
     nft delete table inet netmod 2>/dev/null
     
-    # Restore DNS
     uci set dhcp.@dnsmasq[0].noresolv='0'
     uci -q delete dhcp.@dnsmasq[0].server
     uci commit dhcp
     /etc/init.d/dnsmasq restart
+}
+
+stop_service() {
+    stop_processes
+    cleanup_network
     
     logger -t netmod "Service stopped"
 }
@@ -221,7 +252,15 @@ function get_status()
     local sys = require "luci.sys"
     local status = {
         tunnel = (sys.call("pgrep -f autossh > /dev/null 2>&1") == 0),
-        redsocks = (sys.call("pgrep redsocks > /dev/null 2>&1") == 0)
+        redsocks = (sys.call("pgrep redsocks > /dev/null 2>&1") == 0),
+        https_dns_proxy = (sys.call("pgrep https-dns-proxy > /dev/null 2>&1") == 0),
+        deps = {
+            autossh = (sys.call("command -v autossh > /dev/null 2>&1") == 0),
+            redsocks = (sys.call("command -v redsocks > /dev/null 2>&1") == 0),
+            https_dns_proxy = (sys.call("command -v https-dns-proxy > /dev/null 2>&1") == 0),
+            nft = (sys.call("command -v nft > /dev/null 2>&1") == 0),
+            sshpass = (sys.call("command -v sshpass > /dev/null 2>&1") == 0)
+        }
     }
     luci.http.prepare_content("application/json")
     luci.http.write_json(status)
@@ -231,8 +270,8 @@ CONTROLLER_EOF
     # Model (CBI form)
     mkdir -p /usr/lib/lua/luci/model/cbi
     cat > /usr/lib/lua/luci/model/cbi/netmod.lua << 'MODEL_EOF'
-m = Map("netmod", translate("NetMod SSH Tunnel"), 
-    translate("Bypass internet filtering using SSH tunnel (similar to NetMod for Windows)"))
+m = Map("netmod", translate("NetMod"), 
+    translate("NetMod is a free, advanced VPN client and set of network tool, offering VPN protocols including SSH, HTTP(S), Socks, VMess, VLess, Trojan, Shadowsocks"))
 
 -- Status section
 s = m:section(TypedSection, "netmod")
@@ -259,6 +298,10 @@ o = s:option(Value, "username", translate("Username"))
 o.default = "root"
 o.placeholder = "root"
 
+o = s:option(Value, "password", translate("Password"))
+o.password = true
+o.rmempty = true
+
 -- SSH Key section
 s2 = m:section(TypedSection, "netmod", translate("SSH Public Key"))
 s2.anonymous = true
@@ -278,6 +321,7 @@ MODEL_EOF
 XHR.poll(3, '<%=url("admin/services/netmod/status")%>', null,
     function(x, st) {
         var elem = document.getElementById('netmod_status');
+        var depsElem = document.getElementById('netmod_deps');
         if (st && st.tunnel && st.redsocks) {
             elem.innerHTML = '<span style="color:green;font-weight:bold">● Connected</span>';
         } else if (st && (st.tunnel || st.redsocks)) {
@@ -285,12 +329,25 @@ XHR.poll(3, '<%=url("admin/services/netmod/status")%>', null,
         } else {
             elem.innerHTML = '<span style="color:red;font-weight:bold">● Disconnected</span>';
         }
+
+        if (depsElem && st && st.deps) {
+            var items = [];
+            items.push('autossh: ' + (st.deps.autossh ? 'OK' : 'Missing'));
+            items.push('redsocks: ' + (st.deps.redsocks ? 'OK' : 'Missing'));
+            items.push('https-dns-proxy: ' + (st.deps.https_dns_proxy ? 'OK' : 'Missing'));
+            items.push('nft: ' + (st.deps.nft ? 'OK' : 'Missing'));
+            items.push('sshpass: ' + (st.deps.sshpass ? 'OK' : 'Missing'));
+            depsElem.innerHTML = items.join(' | ');
+        }
     }
 );
 //]]></script>
 <span id="netmod_status">
     <em><%:Checking status...%></em>
 </span>
+<div style="margin-top:8px;font-size:12px;color:#666;" id="netmod_deps">
+    <em><%:Checking dependencies...%></em>
+</div>
 STATUS_TPL_EOF
     
     # SSH Key template
@@ -322,9 +379,9 @@ Package: ${PACKAGE}
 Version: ${VERSION}
 Architecture: all
 Maintainer: miladjs <https://github.com/miladjs>
-Description: SSH tunnel manager for bypassing internet filtering.
- Web-based interface for managing SSH tunnels with automatic
- transparent proxy configuration (NetMod-like for OpenWRT).
+Description: NetMod is a free, advanced VPN client and set of network tool,
+ offering VPN protocols including SSH, HTTP(S), Socks, VMess, VLess, Trojan,
+ Shadowsocks.
 CONTROL_EOF
     
     cat > /usr/lib/opkg/info/${PACKAGE}.list << LIST_EOF
